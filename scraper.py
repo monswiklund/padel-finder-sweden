@@ -6,12 +6,29 @@ import re
 from datetime import datetime
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+from thefuzz import fuzz, process
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
 
 OUTPUT_FILE = "frontend-poc/src/tournaments.json"
 
 async def scrape_rankedin():
     events = []
     print("🚀 Starting Rankedin Scraper (Real Data)...")
+    
+    geolocator = Nominatim(user_agent="padel_scraper_poc")
+    location_cache = {}
+
+    def get_coords(city_name):
+        if city_name in location_cache: return location_cache[city_name]
+        try:
+            loc = geolocator.geocode(f"{city_name}, Sweden", timeout=2)
+            if loc:
+                location_cache[city_name] = (loc.latitude, loc.longitude)
+                return (loc.latitude, loc.longitude)
+        except:
+             pass
+        return (None, None)
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -32,12 +49,26 @@ async def scrape_rankedin():
         except:
             pass
 
-        # 2. Broad Search Strategy: multiple keywords to capture more events
-        # Rankedin's search is fuzzy, so searching for months often finds events in that month.
-        queries = ["Sweden", "Januari", "Februari", "March", "April", "Vista", "SPT"]
+        # 2. Broad Search Strategy: National + Local + Time-based
+        # We combine:
+        # A. Country ("Sweden")
+        # B. Months (Jan-Jun)
+        # C. Major Cities (Stockholm, Gbg, Malmö)
+        # D. User's Local Region (Lidköping, Skara, Skövde)
+        queries = [
+            "Sweden", 
+            "Januari", "Februari", "Mars", "April", "Maj", "Juni",
+            "SPT", "Vista", "Svenska Padelligan",
+            "Stockholm", "Göteborg", "Malmö", "Helsingborg", "Uppsala", "Västerås", "Örebro", "Linköping",
+            "Lidköping", "Skara", "Skövde", "Mariestad", "Vara", "Trollhättan"
+        ]
         
-        # Danish/Foreign Blocklist (Common words in Danish tournament titles)
-        DENMARK_KEYWORDS = ["Denmark", "Danmark", "København", "Smash", "Tuborg", "Carlsberg", "Flammen", "State", "Padelhall Skive", "Odense"]
+        # Foreign Blocklist (Expanded)
+        DENMARK_KEYWORDS = [
+            "Denmark", "Danmark", "København", "Smash", "Tuborg", "Carlsberg", "Flammen", "State", 
+            "Padelhall Skive", "Odense", "Sarajevo", "Karakal", "Riga", "Latvia", "Hills Open", "Finnish",
+            "Slovenia", "Ljubljana", "Luxembourg", "Lithuania"
+        ]
 
         for query in queries:
             print(f"🔎 Performing broad search for: '{query}'...")
@@ -48,10 +79,10 @@ async def scrape_rankedin():
                 await search_box.click()
                 await search_box.fill(query)
                 await page.keyboard.press("Enter")
-                await page.wait_for_timeout(3000) # Wait for generic results
+                await page.wait_for_timeout(2500) # Slightly faster wait
                 
                 # Scroll a bit
-                await page.mouse.wheel(0, 3000)
+                await page.mouse.wheel(0, 4000)
                 await page.wait_for_timeout(1000)
 
                 # Check results
@@ -162,13 +193,51 @@ async def scrape_rankedin():
                          for m_name, m_num in months_sv.items():
                              if f" {m_name}" in text_blob or f"{m_name} " in text_blob:
                                  parsed_date = f"2026-{m_num}-??"
-                                 break
+                                 break # Exit after finding the first month
 
+                    # Initialize city to None first
+                    city = None
+
+                    # Expanded list of Swedish cities/towns for extraction
+                    common_cities = [
+                        "Stockholm", "Göteborg", "Malmö", "Helsingborg", "Uppsala", "Västerås", "Örebro", 
+                        "Linköping", "Lidköping", "Skara", "Skövde", "Mariestad", "Vara", "Trollhättan",
+                        "Borås", "Eskilstuna", "Gävle", "Södertälje", "Norrköping", "Jönköping", "Växjö",
+                        "Halmstad", "Karlstad", "Lund", "Umeå", "Luleå", "Sundsvall", "Kalmar", "Falkenberg",
+                        "Varberg", "Uddevalla", "Skellefteå", "Karlskrona", "Kristianstad", "Visby",
+                        "Landskrona", "Trelleborg", "Motala", "Östersund", "Ängelholm", "Lidingö",
+                        "Alingsås", "Lerum", "Enköping", "Vänersborg", "Huddinge", "Nacka", "Sollentuna"
+                    ]
+                    
+                    # 1. Check Title (High confidence)
+                    for c in common_cities:
+                        if c.lower() in title.lower():
+                            city = c
+                            break
+                    
+                    # 2. Check Text Blob (which contains club/location text)
+                    if not city:
+                         for c in common_cities:
+                            if c.lower() in text_blob.lower():
+                                city = c
+                                break
+                    
+                    # 3. Fallback
+                    if not city:
+                        city = "Sverige"
+
+                    lat, lon = get_coords(city)
+                    # If geocoding failed, ensure lat/lon are None, None
+                    if lat is None or lon is None:
+                        lat, lon = None, None
+                    
                     events.append({
                         "id": abs(hash(full_url)),
                         "title": title[:60] + "..." if len(title) > 60 else title,
                         "club": "Rankedin Verified",
-                        "city": "Sweden", 
+                        "city": city, 
+                        "lat": lat,
+                        "lon": lon,
                         "date": parsed_date,
                         "level": "Open",
                         "type": "Turnering",
@@ -383,12 +452,63 @@ async def scrape_matchi_tv():
         await browser.close()
     return events
 
+async def scrape_duckduckgo_regional():
+    events = []
+    print("🚀 Starting DuckDuckGo Regional Scraper (Lidköping + 50km)...")
+    
+    # Focused list on Lidköping region
+    cities = ["Lidköping", "Skara", "Skövde", "Mariestad", "Vara", "Vänersborg", "Trollhättan"]
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        
+        for city in cities:
+            query = f'site:matchi.se "padel" "turnering" "{city}" 2026'
+            print(f"🦆 Searching DDG for: {query}...")
+            
+            try:
+                await page.goto(f"https://duckduckgo.com/?q={query}&kl=se-sv", timeout=30000)
+                await page.wait_for_timeout(2000)
+                
+                # Extract results
+                results = page.locator("article h2 a")
+                count = await results.count()
+                
+                for i in range(min(count, 3)): # Top 3 per city
+                    link = results.nth(i)
+                    title = await link.inner_text()
+                    href = await link.get_attribute("href")
+                    
+                    if "2026" in title or "2026" in (await page.content()): # content check weak here, improved below
+                         # Basic sanity check
+                         if not href: continue
+                         
+                         events.append({
+                            "id": abs(hash(href)),
+                            "title": f"🔍 {title}", # Prefix to show it's a search result
+                            "club": "Okänd (Google Resultat)",
+                            "city": city, 
+                            "lat": None,
+                            "lon": None,
+                            "date": "2026-??-??", # Hard to parse from Google snippet
+                            "level": "Unknown",
+                            "type": "Webbträff",
+                            "source": "Google/DDG",
+                            "url": href
+                        })
+            except Exception as e:
+                print(f"   ⚠️ DDG Error for {city}: {e}")
+
+        await browser.close()
+    return events
+
 async def main():
     # Run scraper
     rankedin_events = await scrape_rankedin()
-    # matchi_events = await scrape_matchi_tv()
+    ddg_events = await scrape_duckduckgo_regional()
     
-    all_events = rankedin_events # + matchi_events
+    all_events = rankedin_events + ddg_events
     
     # Save to JSON
     print(f"💾 Saving {len(all_events)} events to {OUTPUT_FILE}...")
