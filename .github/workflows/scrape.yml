@@ -1,0 +1,70 @@
+name: Scrape & Deploy
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 3 * * *' # Run at 03:00 UTC every day
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      # 2. Setup Python & Scrape
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          pip install playwright beautifulsoup4 thefuzz
+          playwright install chromium
+
+      - name: Run Scraper
+        run: python scraper.py
+
+      # 3. Commit Data (if changed)
+      - name: Commit Scraped Data
+        run: |
+          git config user.name "Padel Scraper Bot"
+          git config user.email "actions@github.com"
+          git add frontend-poc/src/tournaments.json
+          timestamp=$(date -u)
+          git commit -m "Latest data: ${timestamp}" || echo "No changes to commit"
+          git push
+
+      # 4. Build Frontend
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend-poc/package-lock.json
+
+      - name: Install Node dependencies
+        run: |
+          cd frontend-poc
+          npm ci
+
+      - name: Build Frontend
+        run: |
+          cd frontend-poc
+          npm run build
+
+      # 5. Deploy to GitHub Pages
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./frontend-poc/dist
